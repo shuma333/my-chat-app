@@ -2,7 +2,7 @@ import { useEffect, useState, useRef } from "react";
 import { db, auth } from "./firebase.js";
 import {
   collection, addDoc, query, orderBy, onSnapshot, serverTimestamp,
-  doc, setDoc, getDoc
+  doc, setDoc, getDoc, updateDoc, arrayUnion
 } from "firebase/firestore";
 import {
   signInWithEmailAndPassword, createUserWithEmailAndPassword,
@@ -18,7 +18,35 @@ function App() {
   const [showNicknameInput, setShowNicknameInput] = useState(false);
   const [nicknameInput, setNicknameInput] = useState("");
   const [userProfiles, setUserProfiles] = useState({}); // 全ユーザーのプロフィール
+  const [isWindowActive, setIsWindowActive] = useState(true);
   const messagesEndRef = useRef(null);
+  const lastMessageCountRef = useRef(0);
+
+  // ウィンドウのアクティブ状態を監視
+  useEffect(() => {
+    const handleFocus = () => setIsWindowActive(true);
+    const handleBlur = () => setIsWindowActive(false);
+    const handleVisibilityChange = () => {
+      setIsWindowActive(!document.hidden);
+    };
+
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('blur', handleBlur);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('blur', handleBlur);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []);
+
+  // 通知権限をリクエスト
+  useEffect(() => {
+    if (user && 'Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }, [user]);
 
   // ログイン状態を保持
   useEffect(() => {
@@ -76,6 +104,59 @@ function App() {
     }
   };
 
+  // デスクトップ通知を送信
+  const showNotification = (message) => {
+    if (!isWindowActive && 'Notification' in window && Notification.permission === 'granted') {
+      const notification = new Notification(`${getUserDisplayName(message)} からのメッセージ`, {
+        body: message.text,
+        icon: '/favicon.ico', // アプリのアイコンを設定
+        tag: 'chat-message'
+      });
+
+      // 通知をクリックしたらウィンドウにフォーカス
+      notification.onclick = () => {
+        window.focus();
+        notification.close();
+      };
+
+      // 5秒後に自動で閉じる
+      setTimeout(() => notification.close(), 5000);
+    }
+  };
+
+  // メッセージを既読にマーク
+  const markMessageAsRead = async (messageId) => {
+    if (!user) return;
+
+    try {
+      const messageRef = doc(db, "messages", messageId);
+      await updateDoc(messageRef, {
+        readBy: arrayUnion(user.uid)
+      });
+    } catch (error) {
+      console.error("既読マークエラー:", error);
+    }
+  };
+
+  // 表示されたメッセージを既読にマーク
+  const markVisibleMessagesAsRead = () => {
+    if (!user || !messages.length) return;
+
+    messages.forEach(message => {
+      // 自分以外のメッセージで、まだ既読していないもの
+      if (message.uid !== user.uid && (!message.readBy || !message.readBy.includes(user.uid))) {
+        markMessageAsRead(message.id);
+      }
+    });
+  };
+
+  // ウィンドウがアクティブになったときに既読マーク
+  useEffect(() => {
+    if (isWindowActive) {
+      markVisibleMessagesAsRead();
+    }
+  }, [isWindowActive, messages]);
+
   // メッセージをリアルタイム取得（ユーザーがログインしている時のみ）
   useEffect(() => {
     if (!user || !userProfile) {
@@ -93,6 +174,17 @@ function App() {
         id: doc.id, 
         ...doc.data() 
       }));
+      
+      // 新しいメッセージがあるかチェック（通知用）
+      const newMessageCount = newMessages.length;
+      if (lastMessageCountRef.current > 0 && newMessageCount > lastMessageCountRef.current) {
+        const latestMessage = newMessages[newMessages.length - 1];
+        // 自分のメッセージでない場合のみ通知
+        if (latestMessage.uid !== user.uid) {
+          showNotification(latestMessage);
+        }
+      }
+      lastMessageCountRef.current = newMessageCount;
       
       // メッセージに含まれるユーザーのプロフィールを取得
       const userIds = [...new Set(newMessages.map(msg => msg.uid))];
@@ -113,6 +205,11 @@ function App() {
       
       setUserProfiles(prev => ({ ...prev, ...profiles }));
       setMessages(newMessages);
+      
+      // アクティブウィンドウの場合は既読マーク
+      if (isWindowActive) {
+        setTimeout(markVisibleMessagesAsRead, 100);
+      }
       
       // 少し遅延してスクロール（DOMの更新を待つ）
       setTimeout(scrollToBottom, 100);
@@ -145,6 +242,26 @@ function App() {
     
     // フォールバックとしてメールアドレス
     return msg.email;
+  };
+
+  // 既読状況を表示する関数
+  const getReadStatus = (msg) => {
+    if (msg.uid !== user.uid) return null; // 自分のメッセージのみ
+    
+    if (!msg.readBy || msg.readBy.length === 0) {
+      return "未読";
+    }
+    
+    // 自分以外の既読者数
+    const othersReadCount = msg.readBy.filter(uid => uid !== user.uid).length;
+    
+    if (othersReadCount === 0) {
+      return "未読";
+    } else if (othersReadCount === 1) {
+      return "既読";
+    } else {
+      return `既読 ${othersReadCount}`;
+    }
   };
 
   // ログイン
@@ -194,6 +311,7 @@ function App() {
         uid: user.uid,
         email: user.email,
         nickname: userProfile.nickname, // ニックネームも保存
+        readBy: [user.uid] // 送信者は自動的に既読
       });
       console.log("メッセージ送信成功");
       setInput(""); // 入力欄をクリア
@@ -321,6 +439,16 @@ function App() {
           <span style={{ fontSize: "12px", color: "#666", marginLeft: "8px" }}>
             ({user.email})
           </span>
+          {!isWindowActive && (
+            <span style={{ 
+              fontSize: "12px", 
+              color: "#ff6b6b", 
+              marginLeft: "8px",
+              fontWeight: "bold"
+            }}>
+              📵 バックグラウンド
+            </span>
+          )}
         </div>
         <div style={{ display: "flex", gap: "8px" }}>
           <button 
@@ -353,6 +481,21 @@ function App() {
         </div>
       </div>
 
+      {/* 通知設定情報 */}
+      {Notification.permission === 'denied' && (
+        <div style={{
+          padding: "8px 12px",
+          backgroundColor: "#fff3cd",
+          color: "#856404",
+          border: "1px solid #ffeaa7",
+          borderRadius: "4px",
+          marginBottom: "10px",
+          fontSize: "12px"
+        }}>
+          📢 通知が無効になっています。ブラウザの設定で通知を許可してください。
+        </div>
+      )}
+
       {/* チャット画面 */}
       <div style={{ padding: 10 }}>
         <div style={{
@@ -384,7 +527,8 @@ function App() {
                   padding: "8px 12px",
                   borderRadius: 15,
                   maxWidth: "70%",
-                  boxShadow: "0 1px 2px rgba(0,0,0,0.2)"
+                  boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
+                  position: "relative"
                 }}>
                   {msg.uid !== user.uid && (
                     <div style={{ 
@@ -397,16 +541,30 @@ function App() {
                     </div>
                   )}
                   <div>{msg.text}</div>
-                  {msg.createdAt && (
-                    <div style={{
-                      fontSize: 10,
-                      color: "#999",
-                      marginTop: 2,
-                      textAlign: msg.uid === user.uid ? "right" : "left"
-                    }}>
-                      {new Date(msg.createdAt.toDate()).toLocaleTimeString()}
-                    </div>
-                  )}
+                  <div style={{
+                    fontSize: 10,
+                    color: "#999",
+                    marginTop: 2,
+                    textAlign: msg.uid === user.uid ? "right" : "left",
+                    display: "flex",
+                    justifyContent: msg.uid === user.uid ? "flex-end" : "flex-start",
+                    alignItems: "center",
+                    gap: "4px"
+                  }}>
+                    {msg.createdAt && (
+                      <span>
+                        {new Date(msg.createdAt.toDate()).toLocaleTimeString()}
+                      </span>
+                    )}
+                    {msg.uid === user.uid && (
+                      <span style={{ 
+                        fontSize: 9, 
+                        color: msg.readBy && msg.readBy.filter(uid => uid !== user.uid).length > 0 ? "#007bff" : "#999"
+                      }}>
+                        {getReadStatus(msg)}
+                      </span>
+                    )}
+                  </div>
                 </div>
               </div>
             ))
