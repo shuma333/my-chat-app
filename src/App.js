@@ -2,7 +2,7 @@ import { useEffect, useState, useRef } from "react";
 import { db, auth } from "./firebase.js";
 import {
   collection, addDoc, query, orderBy, onSnapshot, serverTimestamp,
-  doc, setDoc, getDoc
+  doc, setDoc, getDoc, updateDoc, arrayUnion
 } from "firebase/firestore";
 import {
   signInWithEmailAndPassword, createUserWithEmailAndPassword,
@@ -18,8 +18,56 @@ function App() {
   const [showNicknameInput, setShowNicknameInput] = useState(false);
   const [nicknameInput, setNicknameInput] = useState("");
   const [userProfiles, setUserProfiles] = useState({});
+  const [notificationPermission, setNotificationPermission] = useState('default');
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
+  const lastMessageIdRef = useRef(null);
+
+  // PWA通知の初期化
+  useEffect(() => {
+    // Service Worker登録
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js')
+        .then((registration) => {
+          console.log('Service Worker registered:', registration);
+        })
+        .catch((error) => {
+          console.log('Service Worker registration failed:', error);
+        });
+    }
+
+    // 通知権限の確認
+    if ('Notification' in window) {
+      setNotificationPermission(Notification.permission);
+    }
+  }, []);
+
+  // 通知権限をリクエスト
+  const requestNotificationPermission = async () => {
+    if ('Notification' in window && Notification.permission === 'default') {
+      const permission = await Notification.requestPermission();
+      setNotificationPermission(permission);
+      return permission === 'granted';
+    }
+    return Notification.permission === 'granted';
+  };
+
+  // 通知を表示
+  const showNotification = (title, body, icon = '/icon-192.png') => {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+        // Service Worker経由で通知
+        navigator.serviceWorker.controller.postMessage({
+          type: 'SHOW_NOTIFICATION',
+          payload: { title, body, icon }
+        });
+      } else {
+        // 直接通知
+        // eslint-disable-next-line no-new
+        new Notification(title, { body, icon });
+      }
+    }
+  };
 
   // ログイン状態を保持
   useEffect(() => {
@@ -29,6 +77,8 @@ function App() {
       
       if (currentUser) {
         await loadUserProfile(currentUser.uid);
+        // ログイン時に通知権限をリクエスト
+        await requestNotificationPermission();
       } else {
         setUserProfile(null);
       }
@@ -62,7 +112,8 @@ function App() {
         uid: user.uid,
         email: user.email,
         nickname: nicknameInput.trim(),
-        createdAt: serverTimestamp()
+        createdAt: serverTimestamp(),
+        lastSeen: serverTimestamp()
       };
 
       await setDoc(doc(db, "users", user.uid), profile);
@@ -72,9 +123,65 @@ function App() {
       console.log("ニックネーム保存成功:", profile);
     } catch (error) {
       console.error("ニックネーム保存エラー:", error);
-      alert("ニックネームの保存に失敗しました");
+      window.alert("ニックネームの保存に失敗しました");
     }
   };
+
+  // メッセージを既読にする
+  const markAsRead = async (messageId) => {
+    if (!user || !messageId) return;
+    
+    try {
+      const messageRef = doc(db, "messages", messageId);
+      await updateDoc(messageRef, {
+        readBy: arrayUnion(user.uid)
+      });
+    } catch (error) {
+      console.error("既読更新エラー:", error);
+    }
+  };
+
+  // 最後のアクティブ時刻を更新
+  const updateLastSeen = async () => {
+    if (!user) return;
+    
+    try {
+      await updateDoc(doc(db, "users", user.uid), {
+        lastSeen: serverTimestamp()
+      });
+    } catch (error) {
+      console.error("最終閲覧時刻更新エラー:", error);
+    }
+  };
+
+  // ページがアクティブになった時の処理
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (!document.hidden && user) {
+        updateLastSeen();
+        // 表示されているメッセージを既読にする
+        messages.forEach(msg => {
+          if (msg.uid !== user.uid && (!msg.readBy || !msg.readBy.includes(user.uid))) {
+            markAsRead(msg.id);
+          }
+        });
+      }
+    };
+
+    const handleBeforeUnload = () => {
+      if (user) {
+        updateLastSeen();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [user, messages]);
 
   // メッセージをリアルタイム取得
   useEffect(() => {
@@ -93,6 +200,31 @@ function App() {
         id: doc.id, 
         ...doc.data() 
       }));
+      
+      // 新着メッセージの通知チェック
+      if (lastMessageIdRef.current && newMessages.length > 0) {
+        const lastIndex = newMessages.findIndex(msg => msg.id === lastMessageIdRef.current);
+        if (lastIndex !== -1 && lastIndex < newMessages.length - 1) {
+          // 新着メッセージがある
+          const newMessagesOnly = newMessages.slice(lastIndex + 1);
+          newMessagesOnly.forEach(msg => {
+            if (msg.uid !== user.uid && document.hidden) {
+              // 自分以外のメッセージで、画面が非表示の場合に通知
+              const senderName = msg.nickname || userProfiles[msg.uid]?.nickname || msg.email;
+              showNotification(
+                `新着メッセージ from ${senderName}`,
+                msg.text,
+                '/icon-192.png'
+              );
+            }
+          });
+        }
+      }
+      
+      // 最新メッセージIDを記録
+      if (newMessages.length > 0) {
+        lastMessageIdRef.current = newMessages[newMessages.length - 1].id;
+      }
       
       // メッセージに含まれるユーザーのプロファイルを取得
       const userIds = [...new Set(newMessages.map(msg => msg.uid))];
@@ -114,13 +246,24 @@ function App() {
       setUserProfiles(prev => ({ ...prev, ...profiles }));
       setMessages(newMessages);
       
+      // 画面がアクティブな場合、未読メッセージを既読にする
+      if (!document.hidden) {
+        setTimeout(() => {
+          newMessages.forEach(msg => {
+            if (msg.uid !== user.uid && (!msg.readBy || !msg.readBy.includes(user.uid))) {
+              markAsRead(msg.id);
+            }
+          });
+        }, 1000); // 1秒後に既読処理
+      }
+      
       setTimeout(scrollToBottom, 100);
     }, (error) => {
       console.error("メッセージ取得エラー:", error);
     });
 
     return unsubscribe;
-  }, [user, userProfile]);
+  }, [user, userProfile, userProfiles]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -143,10 +286,28 @@ function App() {
     return msg.email;
   };
 
+  // 既読状況を取得
+  const getReadStatus = (msg) => {
+    if (msg.uid === user.uid) {
+      // 自分のメッセージの場合、他の人が読んだかチェック
+      const readBy = msg.readBy || [];
+      const otherUsers = Object.keys(userProfiles).filter(uid => uid !== user.uid);
+      const readByOthers = readBy.filter(uid => uid !== user.uid);
+      
+      if (otherUsers.length === 0) return ""; // 他にユーザーがいない
+      if (readByOthers.length === otherUsers.length) return "既読";
+      if (readByOthers.length > 0) return `${readByOthers.length}人が既読`;
+      return "未読";
+    }
+    return "";
+  };
+
   // ログイン
   const login = async () => {
-    const email = prompt("メールアドレスを入力してください");
-    const password = prompt("パスワードを入力してください");
+    // eslint-disable-next-line no-alert
+    const email = window.prompt("メールアドレスを入力してください");
+    // eslint-disable-next-line no-alert
+    const password = window.prompt("パスワードを入力してください");
     if (!email || !password) return;
 
     try {
@@ -160,15 +321,18 @@ function App() {
         console.log("アカウント作成成功:", userCredential.user.email);
       } catch (createError) {
         console.error("アカウント作成エラー:", createError);
-        alert("ログインまたはアカウント作成に失敗しました。メールアドレスとパスワードを確認してください。");
+        // eslint-disable-next-line no-alert
+        window.alert("ログインまたはアカウント作成に失敗しました。メールアドレスとパスワードを確認してください。");
       }
     }
   };
 
   // ログアウト
   const logout = async () => {
-    if (confirm("ログアウトしますか？")) {
+    // eslint-disable-next-line no-restricted-globals
+    if (window.confirm("ログアウトしますか？")) {
       console.log("ログアウト中...");
+      await updateLastSeen(); // ログアウト前に最終閲覧時刻を更新
       await signOut(auth);
       setUser(null);
       setUserProfile(null);
@@ -193,6 +357,7 @@ function App() {
         uid: user.uid,
         email: user.email,
         nickname: userProfile.nickname,
+        readBy: [user.uid] // 送信者は自動的に既読
       });
       console.log("メッセージ送信成功");
       
@@ -202,7 +367,8 @@ function App() {
       }, 100);
     } catch (error) {
       console.error("メッセージ送信エラー:", error);
-      alert("メッセージの送信に失敗しました");
+      // eslint-disable-next-line no-alert
+      window.alert("メッセージの送信に失敗しました");
       setInput(messageText); // エラー時は元に戻す
     } finally {
       setLoading(false);
@@ -211,7 +377,8 @@ function App() {
 
   // ニックネーム変更
   const changeNickname = () => {
-    const newNickname = prompt("新しいニックネームを入力してください", userProfile?.nickname || "");
+    // eslint-disable-next-line no-alert
+    const newNickname = window.prompt("新しいニックネームを入力してください", userProfile?.nickname || "");
     if (newNickname && newNickname.trim() !== userProfile?.nickname) {
       setNicknameInput(newNickname.trim());
       setShowNicknameInput(true);
@@ -262,6 +429,19 @@ function App() {
     }
   };
 
+  // 通知テスト
+  const testNotification = () => {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      showNotification('テスト通知', 'チャットアプリの通知が正常に動作しています！');
+    } else {
+      requestNotificationPermission().then(granted => {
+        if (granted) {
+          showNotification('通知が有効になりました！', 'バックグラウンドでも通知を受け取れます。');
+        }
+      });
+    }
+  };
+
   // ログインしていない場合
   if (!user) {
     return (
@@ -295,7 +475,8 @@ function App() {
             marginBottom: "30px",
             lineHeight: "1.5"
           }}>
-            リアルタイムでメッセージをやり取りしましょう
+            リアルタイムでメッセージをやり取りしましょう<br/>
+            <small>既読機能・プッシュ通知対応</small>
           </p>
           <button 
             onClick={login}
@@ -311,8 +492,6 @@ function App() {
               transition: "background-color 0.2s",
               width: "100%"
             }}
-            onMouseOver={(e) => e.target.style.backgroundColor = "#0056b3"}
-            onMouseOut={(e) => e.target.style.backgroundColor = "#007bff"}
           >
             ログイン / 新規登録
           </button>
@@ -372,8 +551,6 @@ function App() {
               boxSizing: "border-box",
               transition: "border-color 0.2s"
             }}
-            onFocus={(e) => e.target.style.borderColor = "#007bff"}
-            onBlur={(e) => e.target.style.borderColor = "#e0e0e0"}
             onKeyDown={(e) => e.key === 'Enter' && saveNickname()}
             autoFocus
           />
@@ -469,7 +646,24 @@ function App() {
           </div>
         </div>
         
-        <div style={{ display: "flex", gap: "8px" }}>
+        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          {/* 通知状態表示 */}
+          <button
+            onClick={testNotification}
+            style={{
+              padding: "8px",
+              borderRadius: "8px",
+              border: "none",
+              backgroundColor: notificationPermission === 'granted' ? "#28a745" : "#ffc107",
+              color: "white",
+              cursor: "pointer",
+              fontSize: "14px"
+            }}
+            title={notificationPermission === 'granted' ? "通知テスト" : "通知を有効にする"}
+          >
+            {notificationPermission === 'granted' ? "🔔" : "🔕"}
+          </button>
+          
           <button 
             onClick={changeNickname} 
             style={{ 
@@ -480,16 +674,7 @@ function App() {
               color: "#007bff",
               cursor: "pointer",
               fontSize: "14px",
-              fontWeight: "500",
-              transition: "all 0.2s"
-            }}
-            onMouseOver={(e) => {
-              e.target.style.backgroundColor = "#007bff";
-              e.target.style.color = "white";
-            }}
-            onMouseOut={(e) => {
-              e.target.style.backgroundColor = "white";
-              e.target.style.color = "#007bff";
+              fontWeight: "500"
             }}
           >
             名前変更
@@ -504,16 +689,7 @@ function App() {
               color: "#dc3545",
               cursor: "pointer",
               fontSize: "14px",
-              fontWeight: "500",
-              transition: "all 0.2s"
-            }}
-            onMouseOver={(e) => {
-              e.target.style.backgroundColor = "#dc3545";
-              e.target.style.color = "white";
-            }}
-            onMouseOut={(e) => {
-              e.target.style.backgroundColor = "white";
-              e.target.style.color = "#dc3545";
+              fontWeight: "500"
             }}
           >
             ログアウト
@@ -586,17 +762,31 @@ function App() {
                   }}>
                     <div style={{ marginBottom: "4px" }}>{msg.text}</div>
                     
-                    {/* 時刻表示 */}
-                    {msg.createdAt && (
-                      <div style={{
-                        fontSize: "11px",
-                        opacity: 0.7,
-                        textAlign: msg.uid === user.uid ? "right" : "left",
-                        marginTop: "4px"
-                      }}>
-                        {formatDate(msg.createdAt)}
-                      </div>
-                    )}
+                    {/* 時刻と既読状況表示 */}
+                    <div style={{
+                      fontSize: "11px",
+                      opacity: 0.7,
+                      textAlign: msg.uid === user.uid ? "right" : "left",
+                      marginTop: "4px",
+                      display: "flex",
+                      justifyContent: msg.uid === user.uid ? "flex-end" : "flex-start",
+                      alignItems: "center",
+                      gap: "8px"
+                    }}>
+                      {msg.createdAt && (
+                        <span>{formatDate(msg.createdAt)}</span>
+                      )}
+                      {msg.uid === user.uid && getReadStatus(msg) && (
+                        <span style={{
+                          backgroundColor: "rgba(255,255,255,0.2)",
+                          padding: "2px 6px",
+                          borderRadius: "8px",
+                          fontSize: "10px"
+                        }}>
+                          {getReadStatus(msg)}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>

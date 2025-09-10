@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#007bff" />
+  <meta name="description" content="既読機能とプッシュ通知対応のリアルタイムチャットアプリ" />
+  
+  <!-- PWA関連のメタタグ -->
+  <meta name="application-name" content="チャットアプリ" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="チャットアプリ" />
+  <meta name="format-detection" content="telephone=no" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="msapplication-config" content="%PUBLIC_URL%/browserconfig.xml" />
+  <meta name="msapplication-TileColor" content="#007bff" />
+  <meta name="msapplication-tap-highlight" content="no" />
+
+  <!-- アイコン -->
+  <link rel="apple-touch-icon" href="%PUBLIC_URL%/icon-192.png" />
+  <link rel="icon" type="image/png" sizes="32x32" href="%PUBLIC_URL%/icon-32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="%PUBLIC_URL%/icon-16.png" />
+  
+  <!-- マニフェスト -->
+  <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+  
+  <title>チャットアプリ</title>
+
+  <style>
+    /* PWAインストールプロンプト用のスタイル */
+    .install-prompt {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #007bff;
+      color: white;
+      padding: 16px 24px;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+      z-index: 1000;
+      display: none;
+      align-items: center;
+      gap: 12px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    .install-prompt button {
+      background: white;
+      color: #007bff;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .install-prompt .close-btn {
+      background: transparent;
+      color: white;
+      border: 1px solid white;
+      padding: 4px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-left: 8px;
+    }
+
+    /* オフライン表示用 */
+    .offline-indicator {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      background: #dc3545;
+      color: white;
+      text-align: center;
+      padding: 8px;
+      z-index: 1001;
+      display: none;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    /* ローディング画面 */
+    .loading-screen {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: #f5f5f5;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      z-index: 9999;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    .loading-screen.hidden {
+      display: none;
+    }
+
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 4px solid #e0e0e0;
+      border-top: 4px solid #007bff;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-bottom: 16px;
+    }
+
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <noscript>このアプリを使用するにはJavaScriptを有効にしてください。</noscript>
+  
+  <!-- ローディング画面 -->
+  <div id="loading-screen" class="loading-screen">
+    <div class="spinner"></div>
+    <div>チャットアプリを読み込み中...</div>
+  </div>
+
+  <!-- オフライン表示 -->
+  <div id="offline-indicator" class="offline-indicator">
+    ⚠️ オフラインです。インターネット接続を確認してください。
+  </div>
+
+  <!-- PWAインストールプロンプト -->
+  <div id="install-prompt" class="install-prompt">
+    <span>📱 このアプリをホーム画面に追加しますか？</span>
+    <button id="install-button">インストール</button>
+    <button id="install-dismiss" class="close-btn">×</button>
+  </div>
+
+  <div id="root"></div>
+
+  <script>
+    // ローディング画面の制御
+    window.addEventListener('load', () => {
+      setTimeout(() => {
+        const loadingScreen = document.getElementById('loading-screen');
+        if (loadingScreen) {
+          loadingScreen.classList.add('hidden');
+        }
+      }, 1000);
+    });
+
+    // PWAインストールプロンプト
+    let deferredPrompt;
+    const installPrompt = document.getElementById('install-prompt');
+    const installButton = document.getElementById('install-button');
+    const installDismiss = document.getElementById('install-dismiss');
+
+    window.addEventListener('beforeinstallprompt', (e) => {
+      console.log('PWA: Install prompt ready');
+      e.preventDefault();
+      deferredPrompt = e;
+      
+      // 既にインストール済みかチェック
+      if (!window.matchMedia('(display-mode: standalone)').matches) {
+        installPrompt.style.display = 'flex';
+      }
+    });
+
+    installButton.addEventListener('click', async () => {
+      if (deferredPrompt) {
+        deferredPrompt.prompt();
+        const { outcome } = await deferredPrompt.userChoice;
+        console.log('PWA: Install outcome:', outcome);
+        deferredPrompt = null;
+        installPrompt.style.display = 'none';
+      }
+    });
+
+    installDismiss.addEventListener('click', () => {
+      installPrompt.style.display = 'none';
+      // 24時間後まで再表示しない
+      localStorage.setItem('pwa-install-dismissed', Date.now());
+    });
+
+    // インストール済みの場合はプロンプトを表示しない
+    window.addEventListener('appinstalled', () => {
+      console.log('PWA: App installed');
+      installPrompt.style.display = 'none';
+    });
+
+    // オンライン/オフライン状態の監視
+    const offlineIndicator = document.getElementById('offline-indicator');
+
+    function updateOnlineStatus() {
+      if (navigator.onLine) {
+        offlineIndicator.style.display = 'none';
+      } else {
+        offlineIndicator.style.display = 'block';
+      }
+    }
+
+    window.addEventListener('online', updateOnlineStatus);
+    window.addEventListener('offline', updateOnlineStatus);
+    updateOnlineStatus();
+
+    // Service Worker更新の通知
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        console.log('PWA: Service Worker updated');
+        // 必要に応じてページリロードやユーザー通知
+      });
+    }
+
+    // PWAインストール状態のチェック
+    function isPWA() {
+      return window.matchMedia('(display-mode: standalone)').matches ||
+             window.navigator.standalone === true;
+    }
+
+    if (isPWA()) {
+      console.log('PWA: Running as installed app');
+      // PWAとして起動している場合の処理
+      document.body.classList.add('pwa-mode');
+    }
+
+    // 画面の向きの変更を監視
+    if (screen.orientation) {
+      screen.orientation.addEventListener('change', () => {
+        console.log('PWA: Orientation changed to', screen.orientation.angle);
+      });
+    }
+
+    // アプリの可視性変更を監視
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        console.log('PWA: App hidden');
+      } else {
+        console.log('PWA: App visible');
+      }
+    });
+  </script>
+</body>
+</html>
